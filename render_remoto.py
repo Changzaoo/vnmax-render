@@ -8,6 +8,7 @@ ffmpeg (bootstrap.sh instala).
   python3 render_remoto.py BR.tar.gz --capitulos 2,5    só esses
   python3 render_remoto.py BR.tar.gz --saida /x/BR      onde vai a saída (ex.: pasta do Google Drive)
   python3 render_remoto.py BR.tar.gz --dry-run          só lista o que faria
+  python3 render_remoto.py BR.tar.gz --enviar https://raw.githubusercontent.com/Changzaoo/vnmax-render/main/tunel.txt
   opções: --base ~/vnmax-render  --tmp <pasta com espaço>  --filme  --manter-mestre
 
 Por capítulo (retomável: capítulo com saida/partes/cap-NN.json é pulado):
@@ -20,7 +21,21 @@ roteiro.json, capitulos.txt (marcas de capítulo do filme inteiro) e pronto.json
 Com --filme também junta <ISO>-uma-historia.mp4 (precisa de --manter-mestre).
 
 NÃO publica: traga a pasta de saída de volta e rode, no Windows,
-  python documentario_pais.py <ISO> --publicar --de <pasta trazida>"""
+  python documentario_pais.py <ISO> --publicar --de <pasta trazida>
+
+--enviar <URL>: manda cada capítulo pronto ao RECEPTOR da máquina de casa
+(remoto/receptor.py, exposto por túnel), em vez de alguém trazer a pasta.
+<URL> é a base com a chave ("https://x.trycloudflare.com/up/<CHAVE>") ou o
+endereço de um arquivo que a contém (o tunel.txt do repositório
+Changzaoo/vnmax-render) — neste caso a URL é relida a cada falha, porque o
+túnel muda de endereço quando reinicia. No início pergunta o que já chegou
+(/partes) e pula esses capítulos; por capítulo envia cap-NN.mp4, .jpg,
+-previa.jpg e por último partes/cap-NN.json (até 5 tentativas cada, eco do
+sha256 conferido); no fim junta as partes de todas as sessões e envia
+indice.json, roteiro.json, capitulos.txt e pronto.json."""
+import hashlib
+import urllib.error
+import urllib.request
 import io
 import json
 import os
@@ -141,13 +156,129 @@ def copiar_seguro(src, dst):
     os.replace(tmp, dst)
 
 
-def capitulo(cap, proj, saida, hf, workers, env, manter):
+class Envio:
+    """Cliente do receptor (remoto/receptor.py). Só biblioteca padrão."""
+    PEDACO = 48 * 1024 * 1024   # o Cloudflare recusa corpo > 100 MB
+
+    def __init__(self, alvo, iso):
+        self.alvo, self.iso = alvo.strip(), iso
+        self.base = None
+
+    def resolver(self, de_novo=False):
+        if self.base and not de_novo:
+            return self.base
+        if "/up/" in self.alvo:
+            self.base = self.alvo.rstrip("/")
+        else:   # arquivo com a URL (tunel.txt); sem cache do raw.githubusercontent
+            req = urllib.request.Request(self.alvo + ("&" if "?" in self.alvo else "?") + "t=%d" % time.time(),
+                                         headers={"User-Agent": "vnmax-render/1", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.base = r.read().decode("utf-8").strip().splitlines()[0].strip().rstrip("/")
+        return self.base
+
+    def pedir(self, metodo, caminho, dados=None, cab=None, tempo=120):
+        req = urllib.request.Request(self.resolver() + caminho, data=dados, method=metodo,
+                                     headers=dict({"User-Agent": "vnmax-render/1"}, **(cab or {})))
+        try:
+            with urllib.request.urlopen(req, timeout=tempo) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.load(e)
+            except Exception:
+                return e.code, {}
+
+    def tentar(self, fazer, o_que):
+        ultimo = None
+        for t in range(5):
+            try:
+                return fazer()
+            except Exception as e:
+                ultimo = e
+                diz("  envio: %s falhou (%s) — tentativa %d/5" % (o_que, str(e)[:160], t + 1))
+                if t < 4:
+                    time.sleep(min(60, 5 * 2 ** t))
+                try:
+                    self.resolver(de_novo=True)
+                except Exception:
+                    pass
+        raise RuntimeError("envio de %s falhou 5 vezes: %s" % (o_que, ultimo))
+
+    def ping(self):
+        def f():
+            cod, r = self.pedir("GET", "/ping")
+            if cod != 200 or not r.get("ok"):
+                raise RuntimeError("HTTP %d" % cod)
+            return r
+        return self.tentar(f, "ping")
+
+    def chegou(self):
+        """{nome: {tam, sha256}} do que já está na máquina de casa."""
+        def f():
+            cod, r = self.pedir("GET", "/%s/partes" % self.iso)
+            if cod != 200:
+                raise RuntimeError("HTTP %d" % cod)
+            return r.get("arquivos", {})
+        return self.tentar(f, "lista do que chegou")
+
+    def baixar_json(self, nome):
+        def f():
+            cod, r = self.pedir("GET", "/%s/%s" % (self.iso, nome))
+            if cod != 200:
+                raise RuntimeError("HTTP %d" % cod)
+            return r
+        return self.tentar(f, nome)
+
+    def enviar(self, cam, nome):
+        if SECO:
+            print("    PUT %s → <receptor>/%s/%s" % (cam, self.iso, nome))
+            return
+        h = hashlib.sha256()
+        with open(cam, "rb") as f:
+            for bloco in iter(lambda: f.read(1 << 20), b""):
+                h.update(bloco)
+        sha, total = h.hexdigest(), os.path.getsize(cam)
+
+        def f():
+            off = 0
+            with open(cam, "rb") as arq:
+                while True:
+                    arq.seek(off)
+                    dados = arq.read(self.PEDACO)
+                    cod, r = self.pedir("PUT", "/%s/%s" % (self.iso, nome), dados,
+                                        {"X-Sha256": sha, "X-Total": str(total), "X-Offset": str(off),
+                                         "Content-Type": "application/octet-stream"}, tempo=600)
+                    if cod == 409 and "tem" in r:          # retoma de onde o receptor parou
+                        off = int(r["tem"])
+                        continue
+                    if cod != 200 or not r.get("ok"):
+                        raise RuntimeError("HTTP %d %s" % (cod, r.get("erro", "")))
+                    if r.get("final"):
+                        if r.get("sha256") != sha or r.get("tam") != total:
+                            raise RuntimeError("eco não confere (sha/tamanho)")
+                        return r
+                    off = int(r.get("tem", off + len(dados)))
+                    if off >= total:
+                        raise RuntimeError("o receptor não fechou o arquivo")
+        self.tentar(f, nome)
+        diz("  enviado %s (%.1f MB)" % (nome, total / 1048576))
+
+
+def capitulo(cap, proj, saida, hf, workers, env, manter, envio=None, chegou=None):
     n = cap["n"]
     pasta = os.path.join(proj, "capitulos", cap["pasta"]) if proj else "<trabalho>/capitulos/" + cap["pasta"]
     parte = os.path.join(saida, "partes", "cap-%02d.json" % n)
     web_final = os.path.join(saida, "cap-%02d.mp4" % n)
+    nomes_cap = ["cap-%02d.mp4" % n, "cap-%02d.jpg" % n, "cap-%02d-previa.jpg" % n]
+    if envio and chegou is not None and "partes/cap-%02d.json" % n in chegou and all(x in chegou for x in nomes_cap):
+        diz("já recebido em casa: %s" % cap["pasta"])
+        return None
     if os.path.exists(parte) and os.path.exists(web_final):
         diz("já pronto: %s" % cap["pasta"])
+        if envio:   # pronto aqui mas não chegou lá (envio falhou antes): reenvia
+            for f in nomes_cap:
+                envio.enviar(os.path.join(saida, f), f)
+            envio.enviar(parte, "partes/cap-%02d.json" % n)
         return json.load(io.open(parte, encoding="utf-8"))
     t0 = time.time()
     prev = cap.get("dur_prevista") or 0
@@ -209,6 +340,10 @@ def capitulo(cap, proj, saida, hf, workers, env, manter):
             os.remove(mestre)
     else:
         print("    grava %s" % parte)
+    if envio:
+        for f in nomes_cap:
+            envio.enviar(os.path.join(saida, f), f)
+        envio.enviar(parte, "partes/cap-%02d.json" % n)   # por último: a marca de "chegou inteiro"
     diz("  ok %s: %.1f MB, %.1f min, em %.0f min de máquina" % (cap["pasta"], entrada["mb"], dur / 60, (time.time() - t0) / 60))
     return entrada
 
@@ -302,17 +437,36 @@ def main():
         proj = None
     env = dict(os.environ, TMPDIR=tmp, TEMP=tmp, TMP=tmp, HYPERFRAMES_NO_TELEMETRY="1", DO_NOT_TRACK="1",
                HYPERFRAMES_NO_UPDATE_CHECK="1")
+    envio, chegou = None, None
+    if opc("--enviar"):
+        envio = Envio(opc("--enviar"), iso)
+        if SECO:
+            print("  (dry-run) enviaria ao receptor: %s" % opc("--enviar"))
+        else:
+            diz("receptor: %s" % envio.ping())
+            chegou = envio.chegou()
+            diz("já em casa: %s" % (sorted(k for k in chegou if k.startswith("partes/")) or "nada"))
     erros = []
     for cap in caps:
         try:
-            capitulo(cap, proj, saida, hf, workers, env, manter)
+            capitulo(cap, proj, saida, hf, workers, env, manter, envio, chegou)
         except Exception as erro:   # um capítulo com defeito não para os outros
             diz("ERRO em %s: %s" % (cap["pasta"], str(erro)[-1500:]))
             erros.append(cap["pasta"])
     if SECO:
         print("  no fim: indice.json, roteiro.json, capitulos.txt e pronto.json em %s" % saida)
         return
+    if envio:   # junta as partes de todas as sessões (outras máquinas/pacotes) antes do índice
+        os.makedirs(os.path.join(saida, "partes"), exist_ok=True)
+        for nome in sorted(envio.chegou()):
+            if nome.startswith("partes/cap-") and not os.path.exists(os.path.join(saida, nome)):
+                io.open(os.path.join(saida, nome), "w", encoding="utf-8").write(
+                    json.dumps(envio.baixar_json(nome), ensure_ascii=False))
     fechar(meta, proj, saida, filme)
+    if envio:
+        for f in ("indice.json", "roteiro.json", "capitulos.txt", "pronto.json"):
+            if os.path.exists(os.path.join(saida, f)):
+                envio.enviar(os.path.join(saida, f), f)
     if erros:
         raise SystemExit("capítulos com erro: %s (rode de novo: retoma do que falta)" % erros)
 
